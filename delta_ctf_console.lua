@@ -16,6 +16,10 @@ local FOV_GUI_NAME = GUI_NAME .. "_FOV"
 local REMOTE_LOG_LIMIT = 180
 local EXPANDED_MAIN_SIZE = Vector2.new(1120, 700)
 local COLLAPSED_MAIN_SIZE = Vector2.new(440, 86)
+local TOUCH_EXPANDED_MAIN_SIZE = Vector2.new(960, 600)
+local TOUCH_COLLAPSED_MAIN_SIZE = Vector2.new(360, 72)
+local PHONE_EXPANDED_MAIN_SIZE = Vector2.new(820, 520)
+local PHONE_COLLAPSED_MAIN_SIZE = Vector2.new(300, 62)
 
 local theme = {
     bg = Color3.fromRGB(11, 14, 20),
@@ -579,10 +583,6 @@ local cachedModules = {
     AimAssist = safeRequire(ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("AimAssist"))
 }
 
-local function getCurrentMainSize()
-    return state.collapsed and COLLAPSED_MAIN_SIZE or EXPANDED_MAIN_SIZE
-end
-
 local function getViewportSize()
     local camera = Workspace.CurrentCamera
     if camera then
@@ -591,30 +591,87 @@ local function getViewportSize()
     return Vector2.new(1920, 1080)
 end
 
+local function isPhoneTouchViewport(viewport)
+    return UserInputService.TouchEnabled and math.min(viewport.X, viewport.Y) <= 1400
+end
+
+local function getCurrentMainSize(viewport)
+    viewport = viewport or getViewportSize()
+    if isPhoneTouchViewport(viewport) then
+        return state.collapsed and PHONE_COLLAPSED_MAIN_SIZE or PHONE_EXPANDED_MAIN_SIZE
+    end
+    if UserInputService.TouchEnabled then
+        return state.collapsed and TOUCH_COLLAPSED_MAIN_SIZE or TOUCH_EXPANDED_MAIN_SIZE
+    end
+    return state.collapsed and COLLAPSED_MAIN_SIZE or EXPANDED_MAIN_SIZE
+end
+
 local function applyResponsiveLayout()
     local viewport = getViewportSize()
-    local baseSize = getCurrentMainSize()
-    local compactLayout = UserInputService.TouchEnabled or viewport.X < 1180 or viewport.Y < 760
-    local horizontalPadding = compactLayout and 16 or 48
-    local verticalPadding = compactLayout and 18 or 48
+    local baseSize = getCurrentMainSize(viewport)
+    local touchLayout = UserInputService.TouchEnabled
+    local phoneTouch = isPhoneTouchViewport(viewport)
+    local compactLayout = touchLayout or viewport.X < 1180 or viewport.Y < 760
+    local horizontalPadding = phoneTouch and 40 or (compactLayout and 24 or 48)
+    local verticalPadding = phoneTouch and 30 or (compactLayout and 24 or 48)
     local widthScale = math.max((viewport.X - horizontalPadding) / baseSize.X, 0.2)
     local heightScale = math.max((viewport.Y - verticalPadding) / baseSize.Y, 0.2)
     local scale = math.min(widthScale, heightScale, 1)
 
+    if touchLayout then
+        local touchScaleCap
+        if phoneTouch then
+            touchScaleCap = state.collapsed and 0.62 or 0.78
+        else
+            touchScaleCap = state.collapsed and 0.74 or 0.9
+        end
+        scale = math.min(scale, touchScaleCap)
+    end
+
     mainScale.Scale = math.clamp(scale, 0.28, 1)
-    subtitle.Visible = not compactLayout
+    local topBarHeight = phoneTouch and 46 or (touchLayout and 50 or 54)
+    local topMaskOffset = math.max(topBarHeight - 34, 12)
+    local outerMargin = phoneTouch and 10 or 12
+    local footerHeight = phoneTouch and 28 or 32
+    local footerMargin = phoneTouch and 8 or 12
+    local bottomGap = 6
+    local railWidth = phoneTouch and 150 or 164
+    local railGap = 12
+    local railTop = topBarHeight + 14
+    local buttonSize = phoneTouch and Vector2.new(32, 28) or (compactLayout and Vector2.new(38, 30) or Vector2.new(34, 28))
+    local buttonRightInset = phoneTouch and 10 or 14
+    local buttonGap = phoneTouch and 8 or 10
+
+    topBar.Size = UDim2.new(1, 0, 0, topBarHeight)
+    topMask.Position = UDim2.fromOffset(0, topMaskOffset)
+    topMask.Size = UDim2.new(1, 0, 0, topBarHeight - topMaskOffset)
+    leftRail.Position = UDim2.fromOffset(outerMargin, railTop)
+    leftRail.Size = UDim2.new(0, railWidth, 1, -(railTop + footerHeight + footerMargin + bottomGap))
+    contentHolder.Position = UDim2.fromOffset(outerMargin + railWidth + railGap, railTop)
+    contentHolder.Size = UDim2.new(1, -((outerMargin * 2) + railWidth + railGap), 1, -(railTop + footerHeight + footerMargin + bottomGap))
+    footer.Position = UDim2.new(0, outerMargin, 1, -(footerHeight + footerMargin))
+    footer.Size = UDim2.new(1, -(outerMargin * 2), 0, footerHeight)
+
+    subtitle.Visible = not compactLayout and not state.collapsed
     footerRight.Visible = not compactLayout and not state.collapsed
-    footerLeft.Size = compactLayout and UDim2.new(1, -24, 1, 0) or UDim2.new(0.68, 0, 1, 0)
-    title.Size = compactLayout and UDim2.new(1, -108, 0, 24) or UDim2.new(1, -250, 0, 18)
-    title.Position = compactLayout and UDim2.fromOffset(16, 15) or UDim2.fromOffset(18, 10)
-    closeButton.Size = compactLayout and UDim2.fromOffset(38, 30) or UDim2.fromOffset(34, 28)
-    collapseButton.Size = compactLayout and UDim2.fromOffset(38, 30) or UDim2.fromOffset(34, 28)
-    closeButton.Position = UDim2.new(1, -14, 0.5, 0)
-    collapseButton.Position = UDim2.new(1, -58, 0.5, 0)
+    footerLeft.Position = UDim2.fromOffset(phoneTouch and 10 or 12, 0)
+    footerLeft.Size = phoneTouch and UDim2.new(1, -20, 1, 0) or (compactLayout and UDim2.new(1, -24, 1, 0) or UDim2.new(0.68, 0, 1, 0))
+    footerLeft.TextSize = phoneTouch and 11 or 12
+    title.Size = phoneTouch and UDim2.new(1, -88, 0, 20) or (compactLayout and UDim2.new(1, -108, 0, 24) or UDim2.new(1, -250, 0, 18))
+    title.Position = phoneTouch and UDim2.fromOffset(14, state.collapsed and 12 or 11) or (compactLayout and UDim2.fromOffset(16, 15) or UDim2.fromOffset(18, 10))
+    title.TextSize = phoneTouch and (state.collapsed and 16 or 18) or (compactLayout and 19 or 20)
+    subtitle.Position = phoneTouch and UDim2.fromOffset(14, 26) or UDim2.fromOffset(18, 28)
+    subtitle.Size = phoneTouch and UDim2.new(1, -88, 0, 14) or UDim2.new(1, -250, 0, 16)
+    closeButton.Size = UDim2.fromOffset(buttonSize.X, buttonSize.Y)
+    collapseButton.Size = UDim2.fromOffset(buttonSize.X, buttonSize.Y)
+    closeButton.Position = UDim2.new(1, -buttonRightInset, 0.5, 0)
+    collapseButton.Position = UDim2.new(1, -(buttonRightInset + buttonSize.X + buttonGap), 0.5, 0)
+    closeButton.TextSize = phoneTouch and 13 or 14
+    collapseButton.TextSize = phoneTouch and 16 or 18
 end
 
 local function syncMainSize()
-    local size = getCurrentMainSize()
+    local size = getCurrentMainSize(getViewportSize())
     main.Size = UDim2.fromOffset(size.X, size.Y)
     applyResponsiveLayout()
 end
