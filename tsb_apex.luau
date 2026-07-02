@@ -81,12 +81,35 @@ local function stroke(c,t) return new("UIStroke",{Color=c or T.stroke,Thickness=
 local function pad(p) return new("UIPadding",{PaddingTop=UDim.new(0,p),PaddingBottom=UDim.new(0,p),PaddingLeft=UDim.new(0,p),PaddingRight=UDim.new(0,p)}) end
 local function grad(rot,a,b) return new("UIGradient",{Color=ColorSequence.new(a or T.accentA,b or T.accentB),Rotation=rot or 0}) end
 
+local DESIGN_MAIN_SIZE=Vector2.new(620,430)
+local MINIMIZED_MAIN_SIZE=Vector2.new(620,48)
+local MIN_UI_SCALE=0.58
+local MOBILE_VIEWPORT_X=820
+local function getViewportSize()
+    local camera=Workspace.CurrentCamera
+    if camera then return camera.ViewportSize end
+    return Vector2.new(1280,720)
+end
+local function isCompactViewport()
+    local vp=getViewportSize()
+    return UserInputService.TouchEnabled or vp.X<=MOBILE_VIEWPORT_X
+end
+local function getTargetScale(size)
+    local vp=getViewportSize()
+    local marginX=isCompactViewport() and 24 or 140
+    local marginY=isCompactViewport() and 32 or 140
+    local availableX=math.max(280,vp.X-marginX)
+    local availableY=math.max(220,vp.Y-marginY)
+    return math.clamp(math.min(availableX/size.X,availableY/size.Y,1),MIN_UI_SCALE,1)
+end
+
 local ScreenGui=new("ScreenGui",{Name="APEX_V2",ResetOnSpawn=false,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,IgnoreGuiInset=true})
 pcall(function() ScreenGui.Parent=(gethui and gethui()) or game:GetService("CoreGui") end)
 if not ScreenGui.Parent then ScreenGui.Parent=LP:WaitForChild("PlayerGui") end
 if getgenv then getgenv().__APEX=ScreenGui; getgenv().__APEX_STATE=State end
 
-local Main=new("Frame",{Name="Main",Parent=ScreenGui,Size=UDim2.fromOffset(620,430),Position=UDim2.new(0.5,-310,0.5,-215),BackgroundColor3=T.bg,BorderSizePixel=0},{corner(16)})
+local Main=new("Frame",{Name="Main",Parent=ScreenGui,AnchorPoint=Vector2.new(0.5,0.5),Size=UDim2.fromOffset(DESIGN_MAIN_SIZE.X,DESIGN_MAIN_SIZE.Y),Position=UDim2.new(0.5,0,0.5,0),BackgroundColor3=T.bg,BorderSizePixel=0},{corner(16)})
+local MainScale=new("UIScale",{Parent=Main,Scale=1})
 -- 柔和投影(向下,层次感,不是彩色光圈)
 new("ImageLabel",{Parent=Main,BackgroundTransparency=1,ZIndex=0,Image="rbxassetid://6015897843",ImageColor3=Color3.new(0,0,0),ImageTransparency=0.35,Size=UDim2.new(1,48,1,54),Position=UDim2.new(0,-24,0,-18),ScaleType=Enum.ScaleType.Slice,SliceCenter=Rect.new(49,49,450,450)})
 local underGlow=new("Frame",{Parent=Main,BackgroundColor3=T.accentA,BorderSizePixel=0,ZIndex=0,Size=UDim2.new(0.72,0,0,4),Position=UDim2.new(0.14,0,1,-2)},{corner(4),grad(0,T.accentA,T.accentB)})
@@ -138,20 +161,51 @@ local function slider(p,txt,mn,mx,key,cb)
     local bar=new("Frame",{Parent=row,Position=UDim2.new(0,14,1,-16),Size=UDim2.new(1,-28,0,6),BackgroundColor3=T.bg},{corner(3)})
     local fill=new("Frame",{Parent=bar,BackgroundColor3=Color3.new(1,1,1),Size=UDim2.new((def-mn)/(mx-mn),0,1,0)},{corner(3),grad(0)})
     local drag=false
+    local dragInput
     local function set(x) local rel=math.clamp((x-bar.AbsolutePosition.X)/bar.AbsoluteSize.X,0,1); fill.Size=UDim2.new(rel,0,1,0); local v=math.floor((mn+(mx-mn)*rel)*100+0.5)/100; val.Text=tostring(v); if key then State[key]=v end; if cb then pcall(cb,v) end end
-    new("TextButton",{Parent=bar,BackgroundTransparency=1,Size=UDim2.new(1,0,3,0),Position=UDim2.new(0,0,-1,0),Text=""}).MouseButton1Down:Connect(function() drag=true; set(Mouse.X) end)
-    UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 and drag then drag=false; saveCfg() end end)
-    UserInputService.InputChanged:Connect(function(i) if drag and i.UserInputType==Enum.UserInputType.MouseMovement then set(Mouse.X) end end)
+    local hitbox=new("TextButton",{Parent=bar,BackgroundTransparency=1,Size=UDim2.new(1,0,3,0),Position=UDim2.new(0,0,-1,0),Text=""})
+    hitbox.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            drag=true
+            dragInput=i
+            set(i.Position.X)
+        end
+    end)
+    hitbox.InputChanged:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+            dragInput=i
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if drag and (i==dragInput or i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch) then
+            drag=false
+            dragInput=nil
+            saveCfg()
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and (i==dragInput or i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+            set(i.Position.X)
+        end
+    end)
     return row
 end
 local function button(p,txt,cb) local b=new("TextButton",{Parent=p,Size=UDim2.new(1,0,0,38),BackgroundColor3=T.card,Text=txt,TextColor3=T.text,Font=Enum.Font.GothamBold,TextSize=13,AutoButtonColor=false},{corner(10),stroke(T.accentA,1)}); b:FindFirstChildOfClass("UIStroke").Transparency=0.4; b.MouseButton1Click:Connect(function() TweenService:Create(b,TweenInfo.new(0.1),{BackgroundColor3=T.accentA}):Play(); task.delay(0.12,function() TweenService:Create(b,TweenInfo.new(0.2),{BackgroundColor3=T.card}):Play() end); pcall(cb) end); return b end
 
 -- 拖动/最小化/关闭
-do local dr,ds,sp; Top.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dr=true;ds=i.Position;sp=Main.Position end end)
-   UserInputService.InputChanged:Connect(function(i) if dr and i.UserInputType==Enum.UserInputType.MouseMovement then local d=i.Position-ds; Main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end end)
-   UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end end) end
+local function getMainSizeUDim2()
+    local size=mind and MINIMIZED_MAIN_SIZE or DESIGN_MAIN_SIZE
+    return UDim2.fromOffset(size.X,size.Y)
+end
+local function applyResponsiveLayout()
+    MainScale.Scale=getTargetScale(mind and MINIMIZED_MAIN_SIZE or DESIGN_MAIN_SIZE)
+end
+do local dr,ds,sp,dragInput; Top.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dr=true; dragInput=i; ds=i.Position; sp=Main.Position end end)
+   Top.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then dragInput=i end end)
+   UserInputService.InputChanged:Connect(function(i) if dr and i==dragInput then local d=i.Position-ds; Main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end end)
+   UserInputService.InputEnded:Connect(function(i) if dr and (i==dragInput or i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch) then dr=false; dragInput=nil end end) end
 local mind=false
-MinBtn.MouseButton1Click:Connect(function() mind=not mind; TweenService:Create(Main,TweenInfo.new(0.25,Enum.EasingStyle.Quart),{Size=mind and UDim2.fromOffset(620,48) or UDim2.fromOffset(620,430)}):Play(); Body.Visible=not mind; underGlow.Visible=not mind end)
+MinBtn.MouseButton1Click:Connect(function() mind=not mind; TweenService:Create(Main,TweenInfo.new(0.25,Enum.EasingStyle.Quart),{Size=getMainSizeUDim2()}):Play(); Body.Visible=not mind; underGlow.Visible=not mind; applyResponsiveLayout() end)
 CloseBtn.MouseButton1Click:Connect(function() for _,c in pairs(Conn) do pcall(function() c:Disconnect() end) end; TweenService:Create(Main,TweenInfo.new(0.25),{Size=UDim2.fromOffset(0,0),Position=UDim2.new(0.5,0,0.5,0)}):Play(); task.wait(0.26); ScreenGui:Destroy(); if getgenv then getgenv().__APEX=nil end end)
 
 --==================================================================
@@ -562,11 +616,15 @@ bind("togglekey",UserInputService.InputBegan:Connect(function(io,gpe) if gpe the
 
 selectTab("AI 大脑")
 Main.Size=UDim2.fromOffset(0,0); Main.BackgroundTransparency=1
-TweenService:Create(Main,TweenInfo.new(0.4,Enum.EasingStyle.Back),{Size=UDim2.fromOffset(620,430),BackgroundTransparency=0}):Play()
+applyResponsiveLayout()
+bind("viewportResize",Cam:GetPropertyChangedSignal("ViewportSize"):Connect(applyResponsiveLayout))
+TweenService:Create(Main,TweenInfo.new(0.4,Enum.EasingStyle.Back),{Size=UDim2.fromOffset(DESIGN_MAIN_SIZE.X,DESIGN_MAIN_SIZE.Y),BackgroundTransparency=0}):Play()
 task.spawn(function()
-    local n=new("Frame",{Parent=ScreenGui,Size=UDim2.fromOffset(300,58),Position=UDim2.new(1,20,1,-84),BackgroundColor3=T.bg2},{corner(12),stroke(T.accentA,1.5)})
+    local noteWidth=isCompactViewport() and math.min(getViewportSize().X-32,280) or 300
+    local noteX=isCompactViewport() and -16-noteWidth or -320
+    local n=new("Frame",{Parent=ScreenGui,Size=UDim2.fromOffset(noteWidth,58),Position=UDim2.new(1,20,1,-84),BackgroundColor3=T.bg2},{corner(12),stroke(T.accentA,1.5)})
     new("TextLabel",{Parent=n,BackgroundTransparency=1,Position=UDim2.new(0,14,0,0),Size=UDim2.new(1,-20,1,0),Font=Enum.Font.GothamBold,TextSize=13,TextColor3=T.text,TextXAlignment=Enum.TextXAlignment.Left,Text="🧠 APEX OMNI v2 已加载\n行为自适应 AI · 右Ctrl 开关 · 配置已恢复"})
-    TweenService:Create(n,TweenInfo.new(0.5,Enum.EasingStyle.Quint),{Position=UDim2.new(1,-320,1,-84)}):Play()
+    TweenService:Create(n,TweenInfo.new(0.5,Enum.EasingStyle.Quint),{Position=UDim2.new(1,noteX,1,-84)}):Play()
     task.wait(4.5); TweenService:Create(n,TweenInfo.new(0.5),{Position=UDim2.new(1,20,1,-84)}):Play(); task.wait(0.6); n:Destroy()
 end)
 print("[APEX OMNI v2] 行为自适应 AI 大脑已加载 ✓")
