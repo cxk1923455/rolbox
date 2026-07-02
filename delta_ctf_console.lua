@@ -14,6 +14,8 @@ end
 local GUI_NAME = "DeltaCTFConsole"
 local FOV_GUI_NAME = GUI_NAME .. "_FOV"
 local REMOTE_LOG_LIMIT = 180
+local EXPANDED_MAIN_SIZE = Vector2.new(1120, 700)
+local COLLAPSED_MAIN_SIZE = Vector2.new(440, 86)
 
 local theme = {
     bg = Color3.fromRGB(11, 14, 20),
@@ -323,12 +325,16 @@ local main = create("Frame", {
     Name = "Main",
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(1120, 700),
+    Size = UDim2.fromOffset(EXPANDED_MAIN_SIZE.X, EXPANDED_MAIN_SIZE.Y),
     BackgroundColor3 = theme.bg,
     Parent = screenGui
 })
 styleCorner(main, 10)
 styleStroke(main, theme.stroke, 1)
+
+local mainScale = Instance.new("UIScale")
+mainScale.Scale = 1
+mainScale.Parent = main
 
 local topBar = create("Frame", {
     Name = "TopBar",
@@ -572,6 +578,46 @@ local cachedModules = {
     FactionRelations = safeRequire(ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("FactionRelations")),
     AimAssist = safeRequire(ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("AimAssist"))
 }
+
+local function getCurrentMainSize()
+    return state.collapsed and COLLAPSED_MAIN_SIZE or EXPANDED_MAIN_SIZE
+end
+
+local function getViewportSize()
+    local camera = Workspace.CurrentCamera
+    if camera then
+        return camera.ViewportSize
+    end
+    return Vector2.new(1920, 1080)
+end
+
+local function applyResponsiveLayout()
+    local viewport = getViewportSize()
+    local baseSize = getCurrentMainSize()
+    local compactLayout = UserInputService.TouchEnabled or viewport.X < 1180 or viewport.Y < 760
+    local horizontalPadding = compactLayout and 16 or 48
+    local verticalPadding = compactLayout and 18 or 48
+    local widthScale = math.max((viewport.X - horizontalPadding) / baseSize.X, 0.2)
+    local heightScale = math.max((viewport.Y - verticalPadding) / baseSize.Y, 0.2)
+    local scale = math.min(widthScale, heightScale, 1)
+
+    mainScale.Scale = math.clamp(scale, 0.28, 1)
+    subtitle.Visible = not compactLayout
+    footerRight.Visible = not compactLayout and not state.collapsed
+    footerLeft.Size = compactLayout and UDim2.new(1, -24, 1, 0) or UDim2.new(0.68, 0, 1, 0)
+    title.Size = compactLayout and UDim2.new(1, -108, 0, 24) or UDim2.new(1, -250, 0, 18)
+    title.Position = compactLayout and UDim2.fromOffset(16, 15) or UDim2.fromOffset(18, 10)
+    closeButton.Size = compactLayout and UDim2.fromOffset(38, 30) or UDim2.fromOffset(34, 28)
+    collapseButton.Size = compactLayout and UDim2.fromOffset(38, 30) or UDim2.fromOffset(34, 28)
+    closeButton.Position = UDim2.new(1, -14, 0.5, 0)
+    collapseButton.Position = UDim2.new(1, -58, 0.5, 0)
+end
+
+local function syncMainSize()
+    local size = getCurrentMainSize()
+    main.Size = UDim2.fromOffset(size.X, size.Y)
+    applyResponsiveLayout()
+end
 
 local function pushConnection(connection)
     table.insert(connections, connection)
@@ -2604,9 +2650,24 @@ end
 local dragging = false
 local dragStart
 local startPosition
+local viewportSizeConnection
+
+local function bindViewportSizeListener()
+    if viewportSizeConnection then
+        pcall(function()
+            viewportSizeConnection:Disconnect()
+        end)
+        viewportSizeConnection = nil
+    end
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        viewportSizeConnection = pushConnection(camera:GetPropertyChangedSignal("ViewportSize"):Connect(applyResponsiveLayout))
+    end
+end
 
 pushConnection(topBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPosition = main.Position
@@ -2614,13 +2675,13 @@ pushConnection(topBar.InputBegan:Connect(function(input)
 end))
 
 pushConnection(topBar.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false
     end
 end))
 
 pushConnection(UserInputService.InputChanged:Connect(function(input)
-    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
         local delta = input.Position - dragStart
         main.Position = UDim2.new(
             startPosition.X.Scale,
@@ -2638,10 +2699,15 @@ pushConnection(collapseButton.MouseButton1Click:Connect(function()
     contentHolder.Visible = not state.collapsed
     leftRail.Visible = not state.collapsed
     footer.Visible = not state.collapsed
-    main.Size = state.collapsed and UDim2.fromOffset(440, 86) or UDim2.fromOffset(1120, 700)
+    syncMainSize()
     collapseButton.Text = state.collapsed and "+" or "-"
     updateLockCircle()
     setLastAction(state.collapsed and "面板已折叠" or "面板已展开")
+end))
+
+pushConnection(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    bindViewportSizeListener()
+    applyResponsiveLayout()
 end))
 
 pushConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -2656,6 +2722,9 @@ pushConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed
         cleanup()
     end
 end))
+
+bindViewportSizeListener()
+syncMainSize()
 
 pushConnection(RunService.RenderStepped:Connect(function(dt)
     if state.alive then
