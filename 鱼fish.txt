@@ -1,0 +1,2101 @@
+-- Fisch Control Studio
+-- Standalone client controller with no external UI or network dependencies.
+
+local env = getgenv()
+if env.FISCH_CONTROL_STUDIO and env.FISCH_CONTROL_STUDIO.Unload then
+    pcall(env.FISCH_CONTROL_STUDIO.Unload)
+end
+if env.RETURNHUB_FISCH_RUNTIME and env.RETURNHUB_FISCH_RUNTIME.Unload then
+    pcall(env.RETURNHUB_FISCH_RUNTIME.Unload)
+end
+local legacyLibrary = env.RETURNHUB_FISCH_LIBRARY or env.Library
+if legacyLibrary and type(legacyLibrary.Unload) == "function" then
+    pcall(function()
+        legacyLibrary:Unload()
+    end)
+end
+
+pcall(function()
+    local uiRoot = (type(gethui) == "function" and gethui())
+        or game:GetService("CoreGui")
+    for _, child in ipairs(uiRoot:GetChildren()) do
+        if child:IsA("ScreenGui") and child.Name == "Obsidian" then
+            child:Destroy()
+        end
+    end
+end)
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local CoreGui = game:GetService("CoreGui")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+
+local player = Players.LocalPlayer
+while not player do
+    task.wait()
+    player = Players.LocalPlayer
+end
+
+local Runtime = {
+    Alive = true,
+    Unloaded = false,
+    StartedAt = os.clock(),
+    LastTickAt = 0,
+    LastError = nil,
+    ErrorCount = 0,
+    Connections = {},
+    UI = nil,
+    Ready = false,
+    Collapsed = false,
+    Mobile = false,
+}
+
+local Config = {
+    AutoCast = false,
+    AutoShake = false,
+    AutoReel = false,
+    AutoEquip = false,
+    AutoSell = false,
+    AutoSellRules = false,
+    Afk = false,
+    FreezeCharacter = false,
+    InfiniteOxygen = false,
+    SafeMode = true,
+    HumanizedTiming = true,
+    CastProfile = "Adaptive",
+    InputProfile = "Balanced",
+    ReelProfile = "Fast",
+    AutoCollapseForMinigame = false,
+    CastCooldown = 2.4,
+    ShakeDelay = 0.42,
+    ReelDelay = 0.04,
+    SellInterval = 300,
+    GlobalSpacing = 0.18,
+    MaximumActionsPerMinute = 36,
+    PanelScale = 1,
+    TargetRod = nil,
+    TargetBait = nil,
+    TargetBobber = nil,
+    SellFilters = {
+        Limited = false,
+        Exotic = false,
+        Gemstone = false,
+        Legendary = false,
+        Mythical = false,
+        EnchantRelic = false,
+        Secret = false,
+        Apex = false,
+    },
+}
+
+local function track(connection)
+    Runtime.Connections[#Runtime.Connections + 1] = connection
+    return connection
+end
+
+local function disconnectAll()
+    for index = #Runtime.Connections, 1, -1 do
+        local connection = Runtime.Connections[index]
+        Runtime.Connections[index] = nil
+        pcall(function()
+            connection:Disconnect()
+        end)
+    end
+end
+
+local function destroyUI()
+    local root = Runtime.UI
+    Runtime.UI = nil
+    if root and root.Parent then
+        pcall(function()
+            root:Destroy()
+        end)
+    end
+end
+
+local function findPath(root, path)
+    local current = root
+    for segment in string.gmatch(path, "[^/]+") do
+        if not current then
+            return nil
+        end
+        current = current:FindFirstChild(segment)
+    end
+    return current
+end
+
+local function visible(object)
+    if not object then
+        return false
+    end
+    if object:IsA("ScreenGui") then
+        return object.Enabled
+    end
+    if object:IsA("GuiObject") then
+        return object.Visible
+    end
+    return true
+end
+
+local function getCharacter()
+    return player.Character
+end
+
+local function getPlayerGui()
+    return player:FindFirstChildOfClass("PlayerGui")
+end
+
+local function getStats()
+    local playerStats = workspace:FindFirstChild("PlayerStats")
+    local playerEntry = playerStats and playerStats:FindFirstChild(player.Name)
+    local tFolder = playerEntry and playerEntry:FindFirstChild("T")
+    local dataFolder = tFolder and tFolder:FindFirstChild(player.Name)
+    return dataFolder and dataFolder:FindFirstChild("Stats")
+end
+
+local function statValue(name, fallback)
+    local stats = getStats()
+    local value = stats and stats:FindFirstChild(name)
+    if value and value:IsA("ValueBase") then
+        return value.Value
+    end
+    return fallback
+end
+
+local function clientReady()
+    local doneLoading = player:FindFirstChild("DoneLoading")
+    local assetsLoaded = player:FindFirstChild("assetsloaded")
+    local playerGui = getPlayerGui()
+    return game:IsLoaded()
+        and player:GetAttribute("DataLoaded") == true
+        and player:GetAttribute("ToolsLoaded") == true
+        and doneLoading
+        and doneLoading.Value == true
+        and assetsLoaded
+        and assetsLoaded.Value == true
+        and playerGui ~= nil
+end
+
+local RemotePaths = {
+    Cast = { parts = { "packages", "Net", "RF/FishingRod/Cast" }, class = "RemoteFunction" },
+    EquipRod = { parts = { "packages", "Net", "RF/Rod/Equip" }, class = "RemoteFunction" },
+    EquipBait = { parts = { "packages", "Net", "RE/Bait/Equip" }, class = "RemoteEvent" },
+    EquipBobber = { parts = { "packages", "Net", "RE/Bobber/Equip" }, class = "RemoteEvent" },
+    Settings = { parts = { "packages", "Net", "RE/Settings/Edit" }, class = "RemoteEvent" },
+    Sell = { parts = { "events", "Sell" }, class = "RemoteFunction" },
+    SellAll = { parts = { "events", "SellAll" }, class = "RemoteFunction" },
+    Discover = { parts = { "events", "discoverlocation" }, class = "RemoteEvent" },
+    Afk = { parts = { "events", "afk" }, class = "RemoteEvent" },
+}
+
+local RemoteCache = {}
+
+local function resolveRemote(key)
+    local definition = RemotePaths[key]
+    if not definition then
+        return nil
+    end
+
+    local cached = RemoteCache[key]
+    if cached and cached.Parent and cached.ClassName == definition.class then
+        return cached
+    end
+
+    local remote = ReplicatedStorage
+    for _, part in ipairs(definition.parts) do
+        remote = remote and remote:FindFirstChild(part)
+    end
+    if remote and remote.ClassName == definition.class then
+        RemoteCache[key] = remote
+        return remote
+    end
+    return nil
+end
+
+local Queue = {
+    Items = {},
+    Keys = {},
+    Active = false,
+    LastByKey = {},
+    LastResult = "待命",
+    Completed = 0,
+    Failed = 0,
+    Maximum = 32,
+}
+
+local Governor = {
+    History = {},
+    LastAt = 0,
+    LastReason = "ready",
+}
+
+local function randomBetween(minimum, maximum)
+    if not Config.HumanizedTiming or maximum <= minimum then
+        return minimum
+    end
+    return minimum + math.random() * (maximum - minimum)
+end
+
+local function permitAction(now)
+    if not Config.SafeMode then
+        Governor.LastAt = now
+        return true
+    end
+
+    local writeIndex = 1
+    for readIndex = 1, #Governor.History do
+        local timestamp = Governor.History[readIndex]
+        if now - timestamp < 60 then
+            Governor.History[writeIndex] = timestamp
+            writeIndex += 1
+        end
+    end
+    for index = #Governor.History, writeIndex, -1 do
+        Governor.History[index] = nil
+    end
+
+    if now - Governor.LastAt < Config.GlobalSpacing then
+        Governor.LastReason = "global spacing"
+        return false
+    end
+    if #Governor.History >= Config.MaximumActionsPerMinute then
+        Governor.LastReason = "minute budget"
+        return false
+    end
+    Governor.LastAt = now
+    Governor.History[#Governor.History + 1] = now
+    Governor.LastReason = "allowed"
+    return true
+end
+
+local function enqueue(key, remoteKey, mode, arguments, cooldown, delay)
+    if Queue.Keys[key] or #Queue.Items >= Queue.Maximum then
+        return false
+    end
+    Queue.Keys[key] = true
+    Queue.Items[#Queue.Items + 1] = {
+        Key = key,
+        RemoteKey = remoteKey,
+        Mode = mode,
+        Arguments = arguments or {},
+        Cooldown = cooldown or 0,
+        DueAt = os.clock() + (delay or 0),
+        Attempts = 0,
+    }
+    return true
+end
+
+local function removeAction(index)
+    local item = table.remove(Queue.Items, index)
+    if item then
+        Queue.Keys[item.Key] = nil
+    end
+    return item
+end
+
+local function removeQueuedMatching(predicate)
+    for index = #Queue.Items, 1, -1 do
+        local item = Queue.Items[index]
+        if predicate(item) then
+            Queue.Keys[item.Key] = nil
+            table.remove(Queue.Items, index)
+        end
+    end
+end
+
+local function processQueue(now)
+    if Queue.Active then
+        return
+    end
+
+    local item = Queue.Items[1]
+    if not item or now < item.DueAt then
+        return
+    end
+
+    local last = Queue.LastByKey[item.Key] or 0
+    if now - last < item.Cooldown then
+        item.DueAt = last + item.Cooldown
+        return
+    end
+
+    local remote = resolveRemote(item.RemoteKey)
+    if not remote then
+        Queue.LastResult = "远程不可用"
+        removeAction(1)
+        Queue.Failed += 1
+        return
+    end
+
+    if not permitAction(now) then
+        item.DueAt = now + math.max(0.08, Config.GlobalSpacing)
+        return
+    end
+
+    Queue.Active = true
+    removeAction(1)
+    task.spawn(function()
+        local succeeded, result = pcall(function()
+            if item.Mode == "InvokeServer" then
+                return remote:InvokeServer(table.unpack(item.Arguments))
+            end
+            remote:FireServer(table.unpack(item.Arguments))
+            return true
+        end)
+        Queue.Active = false
+        Queue.LastByKey[item.Key] = os.clock()
+
+        if succeeded and result ~= false then
+            Queue.Completed += 1
+            Queue.LastResult = "操作完成"
+        else
+            Queue.Failed += 1
+            Queue.LastResult = "操作失败"
+        end
+    end)
+end
+
+local function listRods()
+    local found = {}
+    local known = {}
+    local function add(name)
+        if type(name) == "string" and name ~= "" and not known[name] then
+            known[name] = true
+            found[#found + 1] = name
+        end
+    end
+
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    local character = getCharacter()
+    for _, container in ipairs({ backpack, character }) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") and string.find(string.lower(item.Name), "rod", 1, true) then
+                    add(item.Name)
+                end
+            end
+        end
+    end
+
+    add(statValue("rod", nil))
+    add(player:GetAttribute("CurrentRod"))
+    table.sort(found)
+    return found
+end
+
+local function listEquipment(kind, prefix)
+    local found = {}
+    local known = {}
+    local function add(name)
+        if type(name) ~= "string" or name == "" or string.lower(name) == "none" then
+            return
+        end
+        if prefix and string.sub(name, 1, #prefix) == prefix then
+            name = string.sub(name, #prefix + 1)
+        end
+        if name ~= "" and not known[name] then
+            known[name] = true
+            found[#found + 1] = name
+        end
+    end
+
+    add(statValue(kind, nil))
+    local stats = getStats()
+    local folder = stats and stats:FindFirstChild(kind)
+    if folder then
+        for _, item in ipairs(folder:GetChildren()) do
+            local owned = true
+            if item:IsA("NumberValue") or item:IsA("IntValue") then
+                owned = item.Value > 0
+            elseif item:IsA("StringValue") then
+                owned = item.Value ~= "" and item.Value ~= "0"
+            end
+            if owned then
+                add(item.Name)
+            end
+        end
+    end
+
+    local gui = getPlayerGui()
+    local list = findPath(gui, "hud/safezone/equipment/" .. kind .. "/scroll/safezone")
+    if list then
+        for _, item in ipairs(list:GetChildren()) do
+            if item:IsA("GuiObject") and string.lower(item.Name) ~= "template" then
+                add(item.Name)
+            end
+        end
+    end
+    table.sort(found)
+    return found
+end
+
+local function equippedRod()
+    local character = getCharacter()
+    if not character then
+        return nil
+    end
+    for _, item in ipairs(character:GetChildren()) do
+        if item:IsA("Tool") then
+            local values = item:FindFirstChild("values")
+            if values and values:FindFirstChild("state") then
+                return item
+            end
+            if string.find(string.lower(item.Name), "rod", 1, true) then
+                return item
+            end
+        end
+    end
+    return nil
+end
+
+local function rodValue(rod, key)
+    local values = rod and rod:FindFirstChild("values")
+    local value = values and values:FindFirstChild(key)
+    if value and value:IsA("ValueBase") then
+        return value.Value
+    end
+    return nil
+end
+
+local RodState = {
+    Equipped = 3,
+    Casting = 4,
+    Searching = 5,
+    Luring = 6,
+    PreReel = 7,
+    Reeling = 8,
+}
+
+local ObservedGUI = {
+    Reel = nil,
+    ReelBornAt = {},
+}
+
+local function shakeButton()
+    local gui = getPlayerGui()
+    local shake = gui and (gui:FindFirstChild("shakeui") or gui:FindFirstChild("ShakeUI"))
+    local safezone = shake and (shake:FindFirstChild("safezone") or shake:FindFirstChild("Safezone"))
+    local button = safezone and (safezone:FindFirstChild("button") or safezone:FindFirstChild("Button"))
+    if button and button:IsA("GuiButton") and visible(button) then
+        return button
+    end
+    return nil
+end
+
+local function reelGui()
+    local reel = ObservedGUI.Reel
+    if reel and not reel.Parent then
+        ObservedGUI.Reel = nil
+        reel = nil
+    end
+    if not reel then
+        local gui = getPlayerGui()
+        reel = gui and (gui:FindFirstChild("reel") or gui:FindFirstChild("Reel"))
+        ObservedGUI.Reel = reel
+    end
+    if reel and visible(reel) then
+        local bar = reel:FindFirstChild("bar") or reel:FindFirstChild("Bar")
+        local fish = bar and (bar:FindFirstChild("fish") or bar:FindFirstChild("Fish"))
+        local playerBar = bar and (bar:FindFirstChild("playerbar") or bar:FindFirstChild("PlayerBar"))
+        if fish and playerBar then
+            return reel
+        end
+    end
+    return nil
+end
+
+local Fishing = {
+    Phase = "Idle",
+    NextCastAt = 0,
+    NextShakeAt = 0,
+    NextReelAt = 0,
+    CastStartedAt = 0,
+    ReelStartedAt = 0,
+    ReelHeld = false,
+    LastFishX = nil,
+    LastFishAt = 0,
+    RecoveryCount = 0,
+    ReelFault = nil,
+}
+
+local function reelSystemHealthy(now)
+    if reelGui() then
+        Fishing.ReelFault = nil
+        return true
+    end
+    local gui = getPlayerGui()
+    if not gui then
+        return true
+    end
+    for _, child in ipairs(gui:GetChildren()) do
+        if (child.Name == "reel" or child.Name == "Reel")
+            and child:IsA("ScreenGui")
+            and not child.Enabled then
+            local bornAt = ObservedGUI.ReelBornAt[child] or (now - 2)
+            if now - bornAt > 1.5 then
+                Fishing.ReelFault = "原生收线界面未启动"
+                return false
+            end
+        end
+    end
+    Fishing.ReelFault = nil
+    return true
+end
+
+local Telemetry = {
+    Rod = nil,
+    StateConnection = nil,
+    State = "Unknown",
+    StateSince = os.clock(),
+    StateTransitions = 0,
+    SessionFishStart = tonumber(statValue("tracker_fishcaught", 0)) or 0,
+    LastBite = false,
+}
+
+local function rodStateName(value)
+    local names = {
+        [0] = "Destroyed",
+        [1] = "Unequipped",
+        [2] = "Equipping",
+        [3] = "Equipped",
+        [4] = "Casting",
+        [5] = "Searching",
+        [6] = "Luring",
+        [7] = "Pre-reel",
+        [8] = "Reeling",
+        [9] = "Catch finished",
+    }
+    return names[value] or ("State " .. tostring(value))
+end
+
+local function bindRodTelemetry()
+    local rod = equippedRod()
+    if rod == Telemetry.Rod then
+        return
+    end
+    if Telemetry.StateConnection then
+        pcall(function()
+            Telemetry.StateConnection:Disconnect()
+        end)
+        Telemetry.StateConnection = nil
+    end
+    Telemetry.Rod = rod
+    Telemetry.StateSince = os.clock()
+    local state = rod and rod:FindFirstChild("values") and rod.values:FindFirstChild("state")
+    if state and state:IsA("ValueBase") then
+        local function readState()
+            Telemetry.State = rodStateName(state.Value)
+            Telemetry.StateSince = os.clock()
+            Telemetry.StateTransitions += 1
+        end
+        readState()
+        Telemetry.StateConnection = state:GetPropertyChangedSignal("Value"):Connect(readState)
+        Runtime.Connections[#Runtime.Connections + 1] = Telemetry.StateConnection
+    else
+        Telemetry.State = "No rod"
+    end
+end
+
+local function setReelHeld(value)
+    if Fishing.ReelHeld == value then
+        return
+    end
+    local succeeded = pcall(function()
+        VirtualInputManager:SendKeyEvent(value, Enum.KeyCode.Space, false, game)
+    end)
+    if succeeded then
+        Fishing.ReelHeld = value
+    end
+end
+
+local function resetFishing(delay)
+    setReelHeld(false)
+    Fishing.Phase = "Idle"
+    Fishing.NextCastAt = os.clock() + (delay or 0)
+    Fishing.NextReelAt = 0
+    Fishing.LastFishX = nil
+    Fishing.LastFishAt = 0
+end
+
+local function castArguments()
+    if Config.CastProfile == "Perfect" then
+        return 100, true
+    end
+    if Config.CastProfile == "Precision" then
+        return 95, false
+    end
+    if Config.CastProfile == "Economy" then
+        return math.random(70, 84), false
+    end
+    return math.random(78, 94), false
+end
+
+local function triggerShake(button, now)
+    if now < Fishing.NextShakeAt then
+        return
+    end
+
+    local baseDelay = math.max(Config.InputProfile == "Rapid" and 0.16 or 0.24, Config.ShakeDelay)
+    local nextDelay = Config.InputProfile == "Humanized"
+        and randomBetween(baseDelay, baseDelay * 1.35)
+        or baseDelay
+    Fishing.NextShakeAt = now + nextDelay
+    task.spawn(function()
+        if not button.Parent or button.AbsoluteSize.X <= 0 or button.AbsoluteSize.Y <= 0 then
+            return
+        end
+        local point = button.AbsolutePosition + button.AbsoluteSize / 2
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 0)
+            task.wait(0.03)
+            VirtualInputManager:SendMouseButtonEvent(point.X, point.Y, 0, false, game, 0)
+        end)
+    end)
+end
+
+local function trackReel(reel, now)
+    if now < Fishing.ReelStartedAt + Config.ReelDelay or now < Fishing.NextReelAt then
+        return
+    end
+
+    local bar = reel:FindFirstChild("bar") or reel:FindFirstChild("Bar")
+    local fish = bar and (bar:FindFirstChild("fish") or bar:FindFirstChild("Fish"))
+    local playerBar = bar and (bar:FindFirstChild("playerbar") or bar:FindFirstChild("PlayerBar"))
+    if not fish or not playerBar then
+        setReelHeld(false)
+        Fishing.NextReelAt = now + 0.1
+        return
+    end
+
+    local fishX = fish.Position.X.Scale
+    local playerX = playerBar.Position.X.Scale
+    local playerSize = playerBar.Size.X.Scale
+    local predicted = fishX
+    if Fishing.LastFishX and now > Fishing.LastFishAt then
+        local elapsed = math.max(now - Fishing.LastFishAt, 0.001)
+        local velocity = math.clamp((fishX - Fishing.LastFishX) / elapsed, -2.2, 2.2)
+        predicted = math.clamp(fishX + velocity * 0.04, 0, 1)
+    end
+    Fishing.LastFishX = fishX
+    Fishing.LastFishAt = now
+
+    local deadzone = math.clamp(playerSize * 0.08, 0.012, 0.045)
+    if predicted > playerX + deadzone then
+        setReelHeld(true)
+    elseif predicted < playerX - deadzone then
+        setReelHeld(false)
+    end
+    Fishing.NextReelAt = now + (Config.InputProfile == "Rapid" and 0.032 or 0.045)
+end
+
+local function stepFishing(now)
+    local rod = equippedRod()
+    local rodState = rodValue(rod, "state")
+    local reel = reelGui()
+    local shake = shakeButton()
+
+    if not reelSystemHealthy(now) then
+        setReelHeld(false)
+        Fishing.Phase = "收线界面异常"
+        return
+    end
+
+    if reel then
+        if Runtime.SetCollapsed and not Runtime.Collapsed then
+            Runtime.SetCollapsed(true)
+        end
+        if Fishing.Phase ~= "Reeling" then
+            Fishing.Phase = "Reeling"
+            Fishing.ReelStartedAt = now
+            Fishing.LastFishX = nil
+            Fishing.LastFishAt = 0
+        end
+        if Config.AutoReel then
+            trackReel(reel, now)
+        else
+            setReelHeld(false)
+        end
+        return
+    end
+
+    if Fishing.Phase == "Reeling" then
+        resetFishing(math.random(12, 24) / 10)
+        return
+    end
+
+    if shake then
+        if Runtime.SetCollapsed and not Runtime.Collapsed then
+            Runtime.SetCollapsed(true)
+        end
+        Fishing.Phase = "Shaking"
+        if Config.AutoShake then
+            triggerShake(shake, now)
+        end
+        return
+    end
+
+    if rodState and rodState >= RodState.Casting then
+        Fishing.Phase = "Fishing"
+        if Fishing.CastStartedAt > 0 and now - Fishing.CastStartedAt > 45 then
+            Fishing.RecoveryCount += 1
+            resetFishing(2)
+        end
+        return
+    end
+
+    if not Config.AutoCast or now < Fishing.NextCastAt then
+        return
+    end
+
+    if not rod or rodState ~= RodState.Equipped or rodValue(rod, "casted") == true then
+        Fishing.NextCastAt = now + 1
+        return
+    end
+
+    local power, perfect = castArguments()
+    if enqueue("cast", "Cast", "InvokeServer", { power, perfect }, Config.CastCooldown) then
+        Fishing.Phase = "Casting"
+        Fishing.CastStartedAt = now
+        Fishing.NextCastAt = now + Config.CastCooldown
+    end
+end
+
+local Equipment = {
+    NextCheckAt = 0,
+    LastList = {},
+    Initialized = false,
+    ManualOverrideUntil = 0,
+}
+
+local function initializeLoadout()
+    if Equipment.Initialized then
+        return
+    end
+    Equipment.Initialized = true
+    Config.TargetRod = Config.TargetRod
+        or player:GetAttribute("CurrentRod")
+        or statValue("rod", nil)
+    Config.TargetBait = Config.TargetBait or statValue("bait", nil)
+    Config.TargetBobber = Config.TargetBobber or statValue("bobber", nil)
+end
+
+local function equipRod(name)
+    if type(name) ~= "string" or name == "" then
+        return false
+    end
+    return enqueue("equip_rod", "EquipRod", "InvokeServer", { name }, 3)
+end
+
+local function equipBait(name)
+    if type(name) ~= "string" or name == "" then
+        return false
+    end
+    return enqueue("equip_bait", "EquipBait", "FireServer", { name }, 1.5)
+end
+
+local function equipBobber(name)
+    if type(name) ~= "string" or name == "" then
+        return false
+    end
+    return enqueue("equip_bobber", "EquipBobber", "FireServer", { name }, 1.5)
+end
+
+local function stepAutoEquip(now)
+    if not Config.AutoEquip or now < Equipment.NextCheckAt then
+        return
+    end
+    if now < Equipment.ManualOverrideUntil then
+        return
+    end
+    Equipment.NextCheckAt = now + 2
+    local targetRod = Config.TargetRod
+    local rod = equippedRod()
+    if targetRod and (not rod or rod.Name ~= targetRod) then
+        equipRod(targetRod)
+    end
+    if Config.TargetBait and statValue("bait", nil) ~= Config.TargetBait then
+        equipBait(Config.TargetBait)
+    end
+    if Config.TargetBobber and statValue("bobber", nil) ~= Config.TargetBobber then
+        equipBobber(Config.TargetBobber)
+    end
+end
+
+local function merchantContext()
+    local merchant = findPath(workspace, "world/npcs/Marc Merchant")
+    local idle = merchant and findPath(merchant, "description/idle")
+    if not merchant or not idle then
+        return nil
+    end
+    return {
+        voice = 12,
+        idle = idle,
+        npc = merchant,
+    }
+end
+
+local Selling = {
+    NextAt = 0,
+}
+
+local function sellAll()
+    local context = merchantContext()
+    if not context then
+        return false
+    end
+    return enqueue("sell_all", "SellAll", "InvokeServer", { context }, 30)
+end
+
+local function sellHeld()
+    local context = merchantContext()
+    if not context then
+        return false
+    end
+    return enqueue("sell_held", "Sell", "InvokeServer", { context }, 1.5)
+end
+
+local function stepAutoSell(now)
+    if not Config.AutoSell or now < Selling.NextAt then
+        return
+    end
+    if sellAll() then
+        Selling.NextAt = now + Config.SellInterval
+    else
+        Selling.NextAt = now + 10
+    end
+end
+
+local SellRules = {
+    Limited = "willautosell_limited",
+    Exotic = "willautosell_exotic",
+    Gemstone = "willautosell_gemstone",
+    Legendary = "willautosell_legendary",
+    Mythical = "willautosell_mythical",
+    EnchantRelic = "willautosell_enchantrelic",
+    Secret = "willautosell_secret",
+    Apex = "willautosell_apex",
+}
+
+local function syncSellRules(forceDisabled)
+    removeQueuedMatching(function(item)
+        return string.sub(item.Key, 1, 9) == "sellrule_"
+    end)
+    for name, setting in pairs(SellRules) do
+        local enabled = not forceDisabled and Config.AutoSellRules and Config.SellFilters[name]
+        enqueue("sellrule_" .. name, "Settings", "FireServer", { setting, enabled == true }, 0.35)
+    end
+end
+
+local Freeze = {
+    Snapshot = nil,
+    NextAt = 0,
+}
+
+local function restoreFreeze()
+    local snapshot = Freeze.Snapshot
+    Freeze.Snapshot = nil
+    if not snapshot then
+        return
+    end
+    pcall(function()
+        if snapshot.Humanoid and snapshot.Humanoid.Parent then
+            snapshot.Humanoid.WalkSpeed = snapshot.WalkSpeed
+            snapshot.Humanoid.JumpPower = snapshot.JumpPower
+            snapshot.Humanoid.UseJumpPower = snapshot.UseJumpPower
+            snapshot.Humanoid.JumpHeight = snapshot.JumpHeight
+            snapshot.Humanoid.AutoRotate = snapshot.AutoRotate
+        end
+        if snapshot.Root and snapshot.Root.Parent then
+            snapshot.Root.Anchored = snapshot.Anchored
+        end
+    end)
+end
+
+local function stepFreeze(now)
+    if not Config.FreezeCharacter then
+        restoreFreeze()
+        return
+    end
+    if now < Freeze.NextAt then
+        return
+    end
+    Freeze.NextAt = now + 0.2
+    local character = getCharacter()
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root then
+        return
+    end
+    if not Freeze.Snapshot or Freeze.Snapshot.Humanoid ~= humanoid then
+        restoreFreeze()
+        Freeze.Snapshot = {
+            Humanoid = humanoid,
+            Root = root,
+            WalkSpeed = humanoid.WalkSpeed,
+            JumpPower = humanoid.JumpPower,
+            JumpHeight = humanoid.JumpHeight,
+            UseJumpPower = humanoid.UseJumpPower,
+            AutoRotate = humanoid.AutoRotate,
+            Anchored = root.Anchored,
+        }
+    end
+    humanoid.WalkSpeed = 0
+    humanoid.JumpPower = 0
+    humanoid.AutoRotate = false
+    root.Anchored = true
+end
+
+local Oxygen = {
+    Snapshot = nil,
+    NextAt = 0,
+}
+
+local function restoreOxygen()
+    local snapshot = Oxygen.Snapshot
+    Oxygen.Snapshot = nil
+    if not snapshot then
+        return
+    end
+    pcall(function()
+        workspace:SetAttribute("IgnoreOxygen", snapshot.IgnoreOxygen)
+        player:SetAttribute("NoWaterZone", snapshot.NoWaterZone)
+        if snapshot.Tank and snapshot.Tank.Parent then
+            snapshot.Tank:SetAttribute("Tier", snapshot.TankTier)
+        end
+    end)
+end
+
+local function stepOxygen(now)
+    if not Config.InfiniteOxygen then
+        restoreOxygen()
+        return
+    end
+    if now < Oxygen.NextAt then
+        return
+    end
+    Oxygen.NextAt = now + 0.5
+    local character = getCharacter()
+    local tank = character and character:FindFirstChild("DivingTank")
+    if not Oxygen.Snapshot then
+        Oxygen.Snapshot = {
+            IgnoreOxygen = workspace:GetAttribute("IgnoreOxygen"),
+            NoWaterZone = player:GetAttribute("NoWaterZone"),
+            Tank = tank,
+            TankTier = tank and tank:GetAttribute("Tier"),
+        }
+    end
+    pcall(function()
+        workspace:SetAttribute("IgnoreOxygen", true)
+        player:SetAttribute("NoWaterZone", true)
+        if tank then
+            tank:SetAttribute("Tier", 9999)
+        end
+    end)
+end
+
+local Discovery = {
+    Pending = {},
+    NextAt = 0,
+    Total = 0,
+    Completed = 0,
+}
+
+local function queueLocationDiscovery()
+    local map = findPath(workspace, "world/map")
+    if not map or not resolveRemote("Discover") then
+        return false
+    end
+    local names = {}
+    local known = {}
+    local function add(name)
+        if type(name) == "string" and name ~= "" and not known[name] then
+            known[name] = true
+            names[#names + 1] = name
+        end
+    end
+    for _, location in ipairs(map:GetChildren()) do
+        if location:IsA("Folder") then
+            for _, child in ipairs(location:GetChildren()) do
+                add(child.Name)
+            end
+        else
+            add(location.Name)
+        end
+    end
+    table.sort(names)
+    Discovery.Pending = names
+    Discovery.Total = #names
+    Discovery.Completed = 0
+    Discovery.NextAt = os.clock()
+    return #names > 0
+end
+
+local function stepDiscovery(now)
+    if #Discovery.Pending == 0 or now < Discovery.NextAt then
+        return
+    end
+    if #Queue.Items >= math.floor(Queue.Maximum / 2) then
+        return
+    end
+    local name = table.remove(Discovery.Pending, 1)
+    if enqueue("discover_" .. name, "Discover", "FireServer", { name }, 0.45) then
+        Discovery.Completed += 1
+        Discovery.NextAt = now + randomBetween(0.55, 0.9)
+    else
+        table.insert(Discovery.Pending, 1, name)
+    end
+end
+
+local Navigation = {
+    Target = nil,
+    Marker = nil,
+}
+
+local function listSpawnNames()
+    local spawns = findPath(workspace, "world/spawns")
+    local names = {}
+    if spawns then
+        for _, spawn in ipairs(spawns:GetChildren()) do
+            names[#names + 1] = spawn.Name
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function spawnPosition(name)
+    local spawns = findPath(workspace, "world/spawns")
+    local spawn = spawns and spawns:FindFirstChild(name or "")
+    if spawn and spawn:IsA("BasePart") then
+        return spawn.Position
+    end
+    if spawn and spawn:IsA("Model") then
+        return spawn:GetPivot().Position
+    end
+    return nil
+end
+
+local function clearWaypoint()
+    if Navigation.Marker then
+        pcall(function()
+            Navigation.Marker:Destroy()
+        end)
+    end
+    Navigation.Marker = nil
+end
+
+local function setWaypoint(name)
+    local position = spawnPosition(name)
+    if not position then
+        return false
+    end
+    clearWaypoint()
+    local marker = Instance.new("Part")
+    marker.Name = "FischControlWaypoint"
+    marker.Anchored = true
+    marker.CanCollide = false
+    marker.CanQuery = false
+    marker.CanTouch = false
+    marker.Material = Enum.Material.Neon
+    marker.Color = Color3.fromRGB(78, 181, 255)
+    marker.Transparency = 0.25
+    marker.Size = Vector3.new(2, 12, 2)
+    marker.CFrame = CFrame.new(position + Vector3.new(0, 6, 0))
+    marker.Parent = workspace
+    Navigation.Target = name
+    Navigation.Marker = marker
+    return true
+end
+
+local function distanceToWaypoint()
+    local position = spawnPosition(Navigation.Target)
+    local character = getCharacter()
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not position or not root then
+        return nil
+    end
+    return math.floor((root.Position - position).Magnitude)
+end
+
+local UI = {
+    Labels = {},
+    Toggles = {},
+    Dynamic = {},
+    Pages = {},
+    Tabs = {},
+    Root = nil,
+}
+
+local function make(className, properties)
+    local instance = Instance.new(className)
+    for key, value in pairs(properties or {}) do
+        instance[key] = value
+    end
+    return instance
+end
+
+local function corner(parent, radius)
+    make("UICorner", {
+        CornerRadius = UDim.new(0, radius),
+        Parent = parent,
+    })
+end
+
+local function stroke(parent, color)
+    make("UIStroke", {
+        Color = color,
+        Transparency = 0.28,
+        Thickness = 1,
+        Parent = parent,
+    })
+end
+
+local function textLabel(parent, text, size, color)
+    return make("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = size or UDim2.fromScale(1, 0),
+        Font = Enum.Font.Gotham,
+        Text = text,
+        TextColor3 = color or Color3.fromRGB(226, 232, 240),
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
+        Parent = parent,
+    })
+end
+
+local function button(parent, text, accent)
+    local control = make("TextButton", {
+        BackgroundColor3 = accent or Color3.fromRGB(37, 47, 65),
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 38),
+        Font = Enum.Font.GothamSemibold,
+        Text = text,
+        TextColor3 = Color3.fromRGB(242, 245, 249),
+        TextSize = 13,
+        Selectable = false,
+        AutoButtonColor = true,
+        Parent = parent,
+    })
+    corner(control, 5)
+    return control
+end
+
+local function setToggleVisual(control, enabled)
+    control.Text = enabled and "开" or "关"
+    control.BackgroundColor3 = enabled
+        and Color3.fromRGB(28, 132, 102)
+        or Color3.fromRGB(61, 72, 88)
+end
+
+local function addToggle(parent, label, key)
+    local row = make("Frame", {
+        BackgroundColor3 = Color3.fromRGB(25, 32, 45),
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 42),
+        Parent = parent,
+    })
+    corner(row, 5)
+    local caption = textLabel(row, label, UDim2.new(1, -78, 1, 0))
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    local control = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = Color3.fromRGB(61, 72, 88),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -5, 0.5, 0),
+        Size = UDim2.fromOffset(62, 30),
+        Font = Enum.Font.GothamBold,
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 12,
+        Parent = row,
+    })
+    corner(control, 4)
+    setToggleVisual(control, Config[key])
+    track(control.Activated:Connect(function()
+        Config[key] = not Config[key]
+        if key == "AutoReel" and not Config[key] then
+            setReelHeld(false)
+        end
+        if key == "AutoSell" then
+            Selling.NextAt = os.clock() + (Config[key] and 3 or 0)
+        end
+        if key == "AutoSellRules" then
+            syncSellRules(not Config[key])
+        end
+        if key == "Afk" then
+            enqueue("afk", "Afk", "FireServer", { Config[key] }, 1)
+        end
+        if key == "FreezeCharacter" and not Config[key] then
+            restoreFreeze()
+        end
+        if key == "InfiniteOxygen" and not Config[key] then
+            restoreOxygen()
+        end
+        setToggleVisual(control, Config[key])
+    end))
+    UI.Toggles[key] = control
+end
+
+local function addButton(parent, text, callback, accent)
+    local control = button(parent, text, accent)
+    track(control.Activated:Connect(function()
+        local ok, errorMessage = xpcall(callback, debug.traceback)
+        if not ok then
+            Runtime.LastError = tostring(errorMessage)
+            Runtime.ErrorCount += 1
+        end
+    end))
+    return control
+end
+
+local function addSection(parent, text)
+    local label = textLabel(parent, text, UDim2.new(1, 0, 0, 22), Color3.fromRGB(120, 191, 255))
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 11
+    return label
+end
+
+local DisplayValues = {
+    Adaptive = "自适应",
+    Perfect = "完美",
+    Precision = "精准",
+    Economy = "省心",
+    Balanced = "平衡",
+    Rapid = "快速",
+    Humanized = "拟真",
+    Fast = "高速",
+    Stable = "稳定",
+}
+
+local DisplayPhases = {
+    Idle = "待机",
+    Casting = "抛竿中",
+    Fishing = "等待鱼讯",
+    Shaking = "摇杆中",
+    Reeling = "收线中",
+    Equipped = "已装备",
+    Searching = "搜寻中",
+    Luring = "引鱼中",
+    ["Pre-reel"] = "准备收线",
+    ["Catch finished"] = "完成捕获",
+    ["No rod"] = "未装备鱼竿",
+    ["收线界面异常"] = "收线界面异常",
+}
+
+local function displayValue(value)
+    return DisplayValues[value] or tostring(value)
+end
+
+local function displayPhase(value)
+    return DisplayPhases[value] or tostring(value)
+end
+
+local function addChoice(parent, prefix, getter, setter, provider)
+    local control
+    local function refresh()
+        control.Text = prefix .. "：" .. displayValue(getter() or "扫描")
+    end
+    control = addButton(parent, prefix .. "：扫描", function()
+        local choices = provider()
+        if #choices == 0 then
+            setter(nil)
+            refresh()
+            return
+        end
+        local current = 0
+        for index, value in ipairs(choices) do
+            if value == getter() then
+                current = index
+                break
+            end
+        end
+        setter(choices[(current % #choices) + 1])
+        refresh()
+    end, Color3.fromRGB(37, 76, 103))
+    UI.Dynamic[#UI.Dynamic + 1] = refresh
+    refresh()
+    return control
+end
+
+local function addStepper(parent, label, getter, setter, delta, minimum, maximum, suffix)
+    local row = make("Frame", {
+        BackgroundColor3 = Color3.fromRGB(25, 32, 45),
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 38),
+        Parent = parent,
+    })
+    corner(row, 5)
+    local caption = textLabel(row, label, UDim2.new(1, -154, 1, 0))
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    local function makeStep(text, x)
+        local control = make("TextButton", {
+            AnchorPoint = Vector2.new(1, 0.5),
+            BackgroundColor3 = Color3.fromRGB(50, 68, 91),
+            BorderSizePixel = 0,
+            Position = UDim2.new(1, x, 0.5, 0),
+            Size = UDim2.fromOffset(30, 28),
+            Font = Enum.Font.GothamBold,
+            Text = text,
+            TextColor3 = Color3.fromRGB(255, 255, 255),
+            TextSize = 16,
+            Parent = row,
+        })
+        corner(control, 4)
+        return control
+    end
+    local decrease = makeStep("-", -112)
+    local increase = makeStep("+", -6)
+    local value = make("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        BackgroundColor3 = Color3.fromRGB(43, 61, 83),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -42, 0.5, 0),
+        Size = UDim2.fromOffset(64, 28),
+        Font = Enum.Font.GothamSemibold,
+        Text = "",
+        TextColor3 = Color3.fromRGB(185, 220, 255),
+        TextSize = 11,
+        Parent = row,
+    })
+    corner(value, 4)
+    value.TextXAlignment = Enum.TextXAlignment.Center
+    local function refresh()
+        local current = getter()
+        value.Text = string.format("%.2g%s", current, suffix or "")
+    end
+    track(decrease.Activated:Connect(function()
+        setter(math.max(minimum, getter() - delta))
+        refresh()
+    end))
+    track(increase.Activated:Connect(function()
+        setter(math.min(maximum, getter() + delta))
+        refresh()
+    end))
+    UI.Dynamic[#UI.Dynamic + 1] = refresh
+    refresh()
+end
+
+local function addRuleToggle(parent, label, key)
+    local row = make("Frame", {
+        BackgroundColor3 = Color3.fromRGB(25, 32, 45),
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 42),
+        Parent = parent,
+    })
+    corner(row, 5)
+    local caption = textLabel(row, label, UDim2.new(1, -78, 1, 0))
+    caption.TextTruncate = Enum.TextTruncate.AtEnd
+    local control = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -5, 0.5, 0),
+        Size = UDim2.fromOffset(62, 30),
+        Font = Enum.Font.GothamBold,
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 12,
+        Parent = row,
+    })
+    corner(control, 4)
+    local function refresh()
+        setToggleVisual(control, Config.SellFilters[key])
+    end
+    track(control.Activated:Connect(function()
+        Config.SellFilters[key] = not Config.SellFilters[key]
+        if Config.AutoSellRules then
+            syncSellRules(false)
+        end
+        refresh()
+    end))
+    refresh()
+end
+
+local function rootParent()
+    if type(gethui) == "function" then
+        local ok, result = pcall(gethui)
+        if ok and result then
+            return result
+        end
+    end
+    return CoreGui
+end
+
+local function createUI()
+    local parent = rootParent()
+    local old = parent:FindFirstChild("FischControlStudio")
+    if old then
+        old:Destroy()
+    end
+
+    local screen = make("ScreenGui", {
+        Name = "FischControlStudio",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 5,
+        Parent = parent,
+    })
+    Runtime.UI = screen
+    UI.Root = screen
+    local scaler = make("UIScale", {
+        Scale = Config.PanelScale,
+        Parent = screen,
+    })
+    Runtime.UIScale = scaler
+
+    local frame = make("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        BackgroundColor3 = Color3.fromRGB(15, 20, 30),
+        BorderSizePixel = 0,
+        Position = UDim2.new(0, 24, 0.5, 0),
+        Size = UDim2.fromOffset(370, 576),
+        Parent = screen,
+    })
+    corner(frame, 7)
+    stroke(frame, Color3.fromRGB(66, 96, 131))
+    Runtime.Window = frame
+
+    local floating = make("TextButton", {
+        Name = "FischControlBubble",
+        AnchorPoint = Vector2.new(1, 1),
+        BackgroundColor3 = Color3.fromRGB(35, 104, 152),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -18, 1, -72),
+        Size = UDim2.fromOffset(54, 54),
+        Font = Enum.Font.GothamBold,
+        Text = "鱼",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 21,
+        Selectable = false,
+        Visible = false,
+        Parent = screen,
+    })
+    corner(floating, 27)
+    stroke(floating, Color3.fromRGB(148, 209, 255))
+    Runtime.Floating = floating
+
+    local function setCollapsed(collapsed)
+        Runtime.Collapsed = collapsed
+        frame.Visible = not collapsed
+        floating.Visible = collapsed
+    end
+    Runtime.SetCollapsed = setCollapsed
+
+    local function applyResponsiveLayout(viewportOverride, mobileOverride)
+        local camera = workspace.CurrentCamera
+        local viewport = viewportOverride or (camera and camera.ViewportSize) or Vector2.new(1280, 720)
+        local mobile = mobileOverride
+        if mobile == nil then
+            mobile = UserInputService.TouchEnabled or viewport.X < 720
+        end
+        Runtime.Mobile = mobile
+        if mobile then
+            frame.AnchorPoint = Vector2.new(0.5, 0.5)
+            frame.Position = UDim2.fromScale(0.5, 0.5)
+            frame.Size = UDim2.fromOffset(
+                math.clamp(viewport.X - 24, 280, 430),
+                math.clamp(viewport.Y - 40, 390, 640)
+            )
+        else
+            frame.AnchorPoint = Vector2.new(0, 0.5)
+            frame.Position = UDim2.new(0, 24, 0.5, 0)
+            frame.Size = UDim2.fromOffset(370, 576)
+        end
+    end
+    Runtime.ApplyResponsiveLayout = applyResponsiveLayout
+    applyResponsiveLayout()
+
+    local header = make("Frame", {
+        BackgroundColor3 = Color3.fromRGB(22, 31, 47),
+        BorderSizePixel = 0,
+        Size = UDim2.new(1, 0, 0, 54),
+        Parent = frame,
+    })
+    corner(header, 7)
+    local title = textLabel(header, "FISCH 控制台", UDim2.new(1, -116, 0, 26), Color3.fromRGB(221, 238, 255))
+    title.Position = UDim2.fromOffset(14, 4)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 14
+    local subtitle = textLabel(header, "轻量运行时 / 实时状态", UDim2.new(1, -116, 0, 15), Color3.fromRGB(140, 164, 190))
+    subtitle.Position = UDim2.fromOffset(14, 28)
+    subtitle.TextSize = 10
+    local minimize = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0),
+        BackgroundColor3 = Color3.fromRGB(48, 76, 106),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -48, 0, 11),
+        Size = UDim2.fromOffset(32, 32),
+        Font = Enum.Font.GothamBold,
+        Text = "−",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 16,
+        Parent = header,
+    })
+    corner(minimize, 5)
+    local close = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0),
+        BackgroundColor3 = Color3.fromRGB(108, 52, 60),
+        BorderSizePixel = 0,
+        Position = UDim2.new(1, -10, 0, 11),
+        Size = UDim2.fromOffset(32, 32),
+        Font = Enum.Font.GothamBold,
+        Text = "收",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 12,
+        Parent = header,
+    })
+    corner(close, 5)
+
+    local tabBar = make("Frame", {
+        BackgroundColor3 = Color3.fromRGB(18, 26, 39),
+        BorderSizePixel = 0,
+        Position = UDim2.fromOffset(8, 62),
+        Size = UDim2.new(1, -16, 0, 38),
+        Parent = frame,
+    })
+    corner(tabBar, 5)
+
+    local pageHost = make("Frame", {
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        Position = UDim2.fromOffset(10, 108),
+        Size = UDim2.new(1, -20, 1, -118),
+        Parent = frame,
+    })
+
+    local function makePage(name)
+        local content = make("ScrollingFrame", {
+            Name = name,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = true,
+            CanvasSize = UDim2.fromOffset(0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.None,
+            ElasticBehavior = Enum.ElasticBehavior.Always,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ScrollingEnabled = true,
+            Size = UDim2.fromScale(1, 1),
+            ScrollBarThickness = 6,
+            ScrollBarImageColor3 = Color3.fromRGB(87, 121, 158),
+            Visible = false,
+            Parent = pageHost,
+        })
+        local layout = make("UIListLayout", {
+            FillDirection = Enum.FillDirection.Vertical,
+            HorizontalAlignment = Enum.HorizontalAlignment.Center,
+            SortOrder = Enum.SortOrder.LayoutOrder,
+            Padding = UDim.new(0, 5),
+            Parent = content,
+        })
+        make("UIPadding", {
+            PaddingBottom = UDim.new(0, 8),
+            Parent = content,
+        })
+        local function updateCanvas()
+            content.CanvasSize = UDim2.fromOffset(0, layout.AbsoluteContentSize.Y + 16)
+        end
+        track(layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(updateCanvas))
+        task.defer(updateCanvas)
+        UI.Pages[name] = content
+        return content
+    end
+
+    local function selectPage(name)
+        for pageName, page in pairs(UI.Pages) do
+            page.Visible = pageName == name
+            if pageName == name then
+                page.CanvasPosition = Vector2.zero
+            end
+        end
+        for tabName, control in pairs(UI.Tabs) do
+            control.BackgroundColor3 = tabName == name
+                and Color3.fromRGB(43, 91, 134)
+                or Color3.fromRGB(30, 42, 59)
+        end
+    end
+    Runtime.SelectPage = selectPage
+
+    local names = {
+        { key = "Fishing", label = "钓鱼" },
+        { key = "Loadout", label = "装备" },
+        { key = "Inventory", label = "背包" },
+        { key = "World", label = "世界" },
+        { key = "Control", label = "控制" },
+    }
+    for index, item in ipairs(names) do
+        local tab = make("TextButton", {
+            BackgroundColor3 = Color3.fromRGB(30, 42, 59),
+            BorderSizePixel = 0,
+            Position = UDim2.new((index - 1) / #names, (index == 1 and 0 or 2), 0, 4),
+            Size = UDim2.new(1 / #names, -3, 1, -8),
+            Font = Enum.Font.GothamSemibold,
+            Text = item.label,
+            TextColor3 = Color3.fromRGB(225, 235, 247),
+            TextSize = 12,
+            Parent = tabBar,
+        })
+        corner(tab, 4)
+        UI.Tabs[item.key] = tab
+        track(tab.Activated:Connect(function()
+            selectPage(item.key)
+        end))
+    end
+
+    local fishing = makePage("Fishing")
+    addSection(fishing, "钓鱼状态机")
+    addToggle(fishing, "自动抛竿", "AutoCast")
+    addToggle(fishing, "自动摇杆", "AutoShake")
+    addToggle(fishing, "自动收线", "AutoReel")
+    addChoice(fishing, "抛竿模式", function()
+        return Config.CastProfile
+    end, function(value)
+        Config.CastProfile = value or "Adaptive"
+    end, function()
+        return { "Adaptive", "Perfect", "Precision", "Economy" }
+    end)
+    addChoice(fishing, "输入模式", function()
+        return Config.InputProfile
+    end, function(value)
+        Config.InputProfile = value or "Balanced"
+    end, function()
+        return { "Balanced", "Rapid", "Humanized" }
+    end)
+    addStepper(fishing, "抛竿间隔", function()
+        return Config.CastCooldown
+    end, function(value)
+        Config.CastCooldown = value
+    end, 0.1, 1.5, 5, "s")
+    addStepper(fishing, "摇杆延迟", function()
+        return Config.ShakeDelay
+    end, function(value)
+        Config.ShakeDelay = value
+    end, 0.05, 0.15, 1.5, "s")
+    addStepper(fishing, "收线响应", function()
+        return Config.ReelDelay
+    end, function(value)
+        Config.ReelDelay = value
+    end, 0.05, 0, 1.5, "s")
+    addToggle(fishing, "冻结角色", "FreezeCharacter")
+
+    local loadout = makePage("Loadout")
+    addSection(loadout, "装备管理")
+    addChoice(loadout, "鱼竿", function()
+        return Config.TargetRod
+    end, function(value)
+        Config.TargetRod = value
+    end, listRods)
+    addChoice(loadout, "鱼饵", function()
+        return Config.TargetBait
+    end, function(value)
+        Config.TargetBait = value
+    end, function()
+        return listEquipment("bait", "bait_")
+    end)
+    addChoice(loadout, "浮标", function()
+        return Config.TargetBobber
+    end, function(value)
+        Config.TargetBobber = value
+    end, function()
+        return listEquipment("bobber")
+    end)
+    addButton(loadout, "装备当前套装", function()
+        equipRod(Config.TargetRod)
+        equipBait(Config.TargetBait)
+        equipBobber(Config.TargetBobber)
+    end, Color3.fromRGB(37, 76, 103))
+    addToggle(loadout, "自动保持套装", "AutoEquip")
+    addSection(loadout, "实时装备")
+    UI.Labels.Loadout = textLabel(loadout, "装备：扫描中", UDim2.new(1, 0, 0, 20), Color3.fromRGB(179, 203, 228))
+    UI.Labels.Capabilities = textLabel(loadout, "协议能力：扫描中", UDim2.new(1, 0, 0, 20), Color3.fromRGB(179, 203, 228))
+
+    local inventory = makePage("Inventory")
+    addSection(inventory, "出售流程")
+    addToggle(inventory, "定时出售背包", "AutoSell")
+    addStepper(inventory, "出售间隔", function()
+        return Config.SellInterval / 60
+    end, function(value)
+        Config.SellInterval = value * 60
+    end, 1, 1, 30, "m")
+    addButton(inventory, "立即出售背包", sellAll, Color3.fromRGB(90, 76, 40))
+    addButton(inventory, "出售手持物", sellHeld, Color3.fromRGB(79, 68, 40))
+    addSection(inventory, "自动出售规则")
+    addToggle(inventory, "应用已选规则", "AutoSellRules")
+    addRuleToggle(inventory, "限量鱼", "Limited")
+    addRuleToggle(inventory, "稀有鱼", "Exotic")
+    addRuleToggle(inventory, "宝石", "Gemstone")
+    addRuleToggle(inventory, "传说鱼", "Legendary")
+    addRuleToggle(inventory, "神话鱼", "Mythical")
+    addRuleToggle(inventory, "附魔遗物", "EnchantRelic")
+    addRuleToggle(inventory, "秘密鱼", "Secret")
+    addRuleToggle(inventory, "顶级鱼", "Apex")
+
+    local world = makePage("World")
+    addSection(world, "世界辅助")
+    addToggle(world, "无限氧气", "InfiniteOxygen")
+    addToggle(world, "挂机状态", "Afk")
+    addChoice(world, "航点", function()
+        return Navigation.Target
+    end, function(value)
+        Navigation.Target = value
+    end, listSpawnNames)
+    addButton(world, "显示当前航点", function()
+        setWaypoint(Navigation.Target)
+    end, Color3.fromRGB(38, 91, 121))
+    addButton(world, "清除航点", clearWaypoint, Color3.fromRGB(65, 54, 71))
+    addButton(world, "发现全部地点", function()
+        queueLocationDiscovery()
+    end, Color3.fromRGB(56, 89, 105))
+    addButton(world, "取消地点任务", function()
+        Discovery.Pending = {}
+        removeQueuedMatching(function(item)
+            return string.sub(item.Key, 1, 9) == "discover_"
+        end)
+    end, Color3.fromRGB(75, 56, 52))
+    UI.Labels.Discovery = textLabel(world, "地点任务：空闲", UDim2.new(1, 0, 0, 20), Color3.fromRGB(179, 203, 228))
+    UI.Labels.WorldInfo = textLabel(world, "世界：扫描中", UDim2.new(1, 0, 0, 32), Color3.fromRGB(179, 203, 228))
+    UI.Labels.WorldInfo.TextWrapped = true
+    addSection(world, "角色状态")
+    UI.Labels.Character = textLabel(world, "角色：扫描中", UDim2.new(1, 0, 0, 20), Color3.fromRGB(179, 203, 228))
+
+    local control = makePage("Control")
+    addSection(control, "自动化保护")
+    addToggle(control, "动作限速", "SafeMode")
+    addToggle(control, "拟真时序", "HumanizedTiming")
+    addStepper(control, "每分钟动作", function()
+        return Config.MaximumActionsPerMinute
+    end, function(value)
+        Config.MaximumActionsPerMinute = math.floor(value)
+    end, 4, 12, 90, "")
+    addStepper(control, "全局间隔", function()
+        return Config.GlobalSpacing
+    end, function(value)
+        Config.GlobalSpacing = value
+    end, 0.05, 0.05, 1, "s")
+    addStepper(control, "界面缩放", function()
+        return Config.PanelScale
+    end, function(value)
+        Config.PanelScale = value
+        if Runtime.UIScale then
+            Runtime.UIScale.Scale = value
+        end
+    end, 0.1, 0.8, 1.3, "x")
+    addButton(control, "收起为悬浮窗", function()
+        if Runtime.SetCollapsed then
+            Runtime.SetCollapsed(true)
+        end
+    end, Color3.fromRGB(48, 76, 106))
+    addSection(control, "会话诊断")
+    UI.Labels.State = textLabel(control, "状态：启动中", UDim2.new(1, 0, 0, 18), Color3.fromRGB(179, 203, 228))
+    UI.Labels.Stats = textLabel(control, "数据：加载中", UDim2.new(1, 0, 0, 18), Color3.fromRGB(179, 203, 228))
+    UI.Labels.Queue = textLabel(control, "队列：空闲", UDim2.new(1, 0, 0, 18), Color3.fromRGB(179, 203, 228))
+    UI.Labels.Error = textLabel(control, "健康：正常", UDim2.new(1, 0, 0, 18), Color3.fromRGB(106, 211, 163))
+    UI.Labels.Telemetry = textLabel(control, "鱼竿遥测：启动中", UDim2.new(1, 0, 0, 18), Color3.fromRGB(179, 203, 228))
+    UI.Labels.Hotkey = textLabel(control, "RightControl：收起或展开", UDim2.new(1, 0, 0, 18), Color3.fromRGB(140, 164, 190))
+    addButton(control, "紧急停止并还原", function()
+        for _, key in ipairs({
+            "AutoCast", "AutoShake", "AutoReel", "AutoEquip", "AutoSell",
+            "AutoSellRules", "Afk", "FreezeCharacter", "InfiniteOxygen",
+        }) do
+            Config[key] = false
+        end
+        Queue.Items = {}
+        Queue.Keys = {}
+        Discovery.Pending = {}
+        syncSellRules(true)
+        setReelHeld(false)
+        resetFishing()
+        restoreFreeze()
+        restoreOxygen()
+        for key, toggle in pairs(UI.Toggles) do
+            setToggleVisual(toggle, Config[key])
+        end
+    end, Color3.fromRGB(130, 58, 58))
+    addButton(control, "重连游戏修复收线界面", function()
+        TeleportService:Teleport(game.PlaceId, player)
+    end, Color3.fromRGB(112, 76, 46))
+    addButton(control, "卸载控制台", function()
+        Runtime.Unload()
+    end, Color3.fromRGB(87, 54, 61))
+
+    track(minimize.Activated:Connect(function()
+        setCollapsed(true)
+    end))
+    track(floating.Activated:Connect(function()
+        setCollapsed(false)
+        applyResponsiveLayout()
+    end))
+    track(close.Activated:Connect(function()
+        setCollapsed(true)
+    end))
+    selectPage("Fishing")
+end
+
+local function updateUI(now)
+    if now < (Runtime.NextUIAt or 0) then
+        return
+    end
+    Runtime.NextUIAt = now + 0.35
+    if not UI.Root or not UI.Root.Parent then
+        return
+    end
+    if Runtime.ApplyResponsiveLayout then
+        Runtime.ApplyResponsiveLayout()
+    end
+
+    for _, refresh in ipairs(UI.Dynamic) do
+        pcall(refresh)
+    end
+
+    local state = UI.Labels.State
+    local stats = UI.Labels.Stats
+    local queue = UI.Labels.Queue
+    local health = UI.Labels.Error
+    if state then
+        if Runtime.Ready then
+            state.Text = "状态：" .. displayPhase(Fishing.Phase) .. " | 恢复次数：" .. Fishing.RecoveryCount
+        else
+            state.Text = "状态：等待游戏数据和资源"
+        end
+    end
+    if stats then
+        stats.Text = ("数据：等级 %s | 金币 %s | %s"):format(
+            tostring(statValue("level", "?")),
+            tostring(statValue("coins", "?")),
+            tostring(statValue("rod", "未装备鱼竿"))
+        )
+    end
+    if queue then
+        queue.Text = ("队列：%d 等待 | %d 成功 | %d 失败"):format(
+            #Queue.Items,
+            Queue.Completed,
+            Queue.Failed
+        )
+    end
+    if health then
+        if Fishing.ReelFault then
+            health.Text = "收线界面异常：请重新进入游戏后再钓鱼"
+            health.TextColor3 = Color3.fromRGB(245, 126, 104)
+        elseif Runtime.ErrorCount > 0 then
+            health.Text = "健康：已恢复错误 " .. Runtime.ErrorCount
+            health.TextColor3 = Color3.fromRGB(245, 181, 90)
+        else
+            health.Text = "健康：正常 | " .. Queue.LastResult
+            health.TextColor3 = Color3.fromRGB(106, 211, 163)
+        end
+    end
+    if UI.Labels.Loadout then
+        UI.Labels.Loadout.Text = ("装备：竿 %s | 饵 %s | 标 %s"):format(
+            tostring(statValue("rod", "none")),
+            tostring(statValue("bait", "none")),
+            tostring(statValue("bobber", "none"))
+        )
+    end
+    if UI.Labels.Capabilities then
+        local cast = resolveRemote("Cast") and "抛竿" or "抛竿缺失"
+        local gear = resolveRemote("EquipRod") and "装备" or "装备缺失"
+        local settings = resolveRemote("Settings") and "规则" or "规则缺失"
+        UI.Labels.Capabilities.Text = "协议能力：" .. cast .. " / " .. gear .. " / " .. settings
+    end
+    if UI.Labels.Discovery then
+        if #Discovery.Pending > 0 then
+            UI.Labels.Discovery.Text = ("地点任务：%d/%d 已排队"):format(
+                Discovery.Completed,
+                Discovery.Total
+            )
+        else
+            UI.Labels.Discovery.Text = "地点任务：空闲"
+        end
+    end
+    if UI.Labels.Character then
+        local character = getCharacter()
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local healthValue = humanoid and math.floor(humanoid.Health) or 0
+        UI.Labels.Character.Text = ("角色：%d HP | 氧气%s | 冻结%s"):format(
+            healthValue,
+            Config.InfiniteOxygen and "保持" or "正常",
+            Config.FreezeCharacter and "开" or "关"
+        )
+    end
+    if UI.Labels.Telemetry then
+        local elapsed = math.floor(now - Telemetry.StateSince)
+        local caught = (tonumber(statValue("tracker_fishcaught", 0)) or 0) - Telemetry.SessionFishStart
+        UI.Labels.Telemetry.Text = ("鱼竿遥测：%s %d 秒 | 本局鱼 %d"):format(
+            displayPhase(Telemetry.State),
+            elapsed,
+            caught
+        )
+    end
+    if UI.Labels.WorldInfo then
+        local character = getCharacter()
+        local zone = character and character:GetAttribute("zone")
+        local zoneValue = character and character:FindFirstChild("zone")
+        if zoneValue and zoneValue:IsA("ValueBase") then
+            zone = zoneValue.Value
+        end
+        local weatherFolder = findPath(workspace, "world/weather")
+        local weather = "晴朗"
+        if weatherFolder then
+            local active = weatherFolder:GetChildren()[1]
+            weather = active and active.Name or weather
+        end
+        local day = workspace:GetAttribute("CurrentDayNumber") or "?"
+        local activeEvent = nil
+        for _, attribute in ipairs({
+            "WhirlpoolActive", "MarianasVeilActive", "ScyllaHuntIsActive", "ReefTitan_IsActive",
+        }) do
+            if workspace:GetAttribute(attribute) == true then
+                activeEvent = attribute:gsub("Active", "")
+                break
+            end
+        end
+        local waypoint = Navigation.Target and (" | 航点 " .. Navigation.Target .. " " .. tostring(distanceToWaypoint() or "?") .. " 格") or ""
+        UI.Labels.WorldInfo.Text = ("世界：%s | %s | 第 %s 天%s%s"):format(
+            tostring(zone or "未知区域"),
+            weather,
+            tostring(day),
+            activeEvent and (" | " .. activeEvent) or "",
+            waypoint
+        )
+    end
+end
+
+function Runtime.Unload()
+    if Runtime.Unloaded then
+        return
+    end
+    Runtime.Unloaded = true
+    Runtime.Alive = false
+    setReelHeld(false)
+    restoreFreeze()
+    restoreOxygen()
+    clearWaypoint()
+    Discovery.Pending = {}
+    Queue.Items = {}
+    Queue.Keys = {}
+    disconnectAll()
+    destroyUI()
+    if env.FISCH_CONTROL_STUDIO == Runtime then
+        env.FISCH_CONTROL_STUDIO = nil
+    end
+end
+
+Runtime.Config = Config
+Runtime.Queue = Queue
+Runtime.Fishing = Fishing
+Runtime.GetStatus = function()
+    return {
+        ready = Runtime.Ready,
+        alive = Runtime.Alive,
+        phase = Fishing.Phase,
+        queued = #Queue.Items,
+        completed = Queue.Completed,
+        failed = Queue.Failed,
+        errors = Runtime.ErrorCount,
+        rodState = Telemetry.State,
+        discoveryPending = #Discovery.Pending,
+        waypoint = Navigation.Target,
+    }
+end
+Runtime.GetCapabilities = function()
+    local capabilities = {}
+    for key in pairs(RemotePaths) do
+        capabilities[key] = resolveRemote(key) ~= nil
+    end
+    return capabilities
+end
+
+env.FISCH_CONTROL_STUDIO = Runtime
+
+track(player.CharacterAdded:Connect(function()
+    setReelHeld(false)
+    restoreFreeze()
+    restoreOxygen()
+    resetFishing(2)
+    Equipment.NextCheckAt = os.clock() + 3
+end))
+
+track(player:GetAttributeChangedSignal("CurrentRod"):Connect(function()
+    if Config.AutoEquip then
+        Equipment.ManualOverrideUntil = os.clock() + 8
+    end
+end))
+
+local function observePlayerGui(child)
+    if child.Name == "reel" or child.Name == "Reel" then
+        ObservedGUI.Reel = child
+        ObservedGUI.ReelBornAt[child] = os.clock()
+    end
+end
+
+local playerGui = getPlayerGui()
+if playerGui then
+    for _, child in ipairs(playerGui:GetChildren()) do
+        observePlayerGui(child)
+    end
+    track(playerGui.ChildAdded:Connect(observePlayerGui))
+    track(playerGui.ChildRemoved:Connect(function(child)
+        if child == ObservedGUI.Reel then
+            ObservedGUI.Reel = nil
+            setReelHeld(false)
+        end
+        ObservedGUI.ReelBornAt[child] = nil
+    end))
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not Runtime.Alive then
+        return
+    end
+    local now = os.clock()
+    if now - Runtime.LastTickAt < 0.08 then
+        return
+    end
+    Runtime.LastTickAt = now
+
+    local succeeded, errorMessage = xpcall(function()
+        Runtime.Ready = clientReady()
+        if not Runtime.Ready then
+            updateUI(now)
+            return
+        end
+        processQueue(now)
+        initializeLoadout()
+        bindRodTelemetry()
+        stepFishing(now)
+        stepAutoEquip(now)
+        stepAutoSell(now)
+        stepFreeze(now)
+        stepOxygen(now)
+        stepDiscovery(now)
+        if (reelGui() or shakeButton()) and Runtime.SetCollapsed and not Runtime.Collapsed then
+            Runtime.SetCollapsed(true)
+        end
+        updateUI(now)
+    end, debug.traceback)
+    if not succeeded then
+        Runtime.ErrorCount += 1
+        Runtime.LastError = tostring(errorMessage)
+    end
+end))
+
+createUI()
+resetFishing(1)
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        local code = input.KeyCode
+        if code.Value >= Enum.KeyCode.One.Value and code.Value <= Enum.KeyCode.Nine.Value then
+            Equipment.ManualOverrideUntil = os.clock() + 8
+            return
+        end
+    end
+    if processed or input.KeyCode ~= Enum.KeyCode.RightControl then
+        return
+    end
+    if Runtime.SetCollapsed then
+        Runtime.SetCollapsed(not Runtime.Collapsed)
+    end
+end))
+print("[Fisch Control Studio] standalone runtime loaded")
